@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, screen, Menu } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, screen, Menu, shell } = require('electron');
 
 // ====== הגדרות ======
 const APP_URL   = 'https://hosting-shifts-infinity-park.netlify.app/';
@@ -18,52 +18,69 @@ function targetDisplay() {
   return chosen;
 }
 
-function placeOn(disp) {
-  const b = disp.bounds;
-  win.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
-  win.setFullScreen(true);
-  win.setAlwaysOnTop(true, 'screen-saver');
-}
-
 function createWindow() {
   const disp = targetDisplay();
   const b = disp.bounds;
   win = new BrowserWindow({
     x: b.x, y: b.y, width: b.width, height: b.height,
-    fullscreen: true, kiosk: true, alwaysOnTop: true,
-    frame: false, autoHideMenuBar: true,
-    closable: false, minimizable: false, maximizable: false,
+    fullscreen: true,           // מסך מלא רגיל
+    autoHideMenuBar: true,
+    minimizable: true,          // אפשר למזער
+    maximizable: true,
     webPreferences: { devTools: false, contextIsolation: true }
   });
-  win.setAlwaysOnTop(true, 'screen-saver');
   win.loadURL(APP_URL);
 
+  // הגנה רק על סגירה: לא ייסגר בלי קוד מנהל (מזעור עדיין מותר)
   win.on('close', (e) => { if (!allowQuit) e.preventDefault(); });
-  win.on('leave-full-screen', () => { if (!allowQuit) win.setFullScreen(true); });
 
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  win.webContents.on('will-navigate', (e, url) => {
-    if (!url.startsWith(APP_URL)) e.preventDefault();
+  // קישורים חיצוניים (כמו בדיקת תו נכה) — חלון צף נפרד מעל האפליקציה
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith(APP_URL)) return { action: 'allow' };
+    openExternal(url);
+    return { action: 'deny' };
   });
-  win.webContents.on('context-menu', (e) => e.preventDefault());
+  // אם האפליקציה מנסה לנווט החוצה (לא בחלון חדש) — נפתח חיצונית במקום
+  win.webContents.on('will-navigate', (e, url) => {
+    if (!url.startsWith(APP_URL)) { e.preventDefault(); openExternal(url); }
+  });
+
+  // חוסם רק מקשים מסוכנים — הקלדה רגילה ולחיצות עובדות כרגיל
   win.webContents.on('before-input-event', (e, input) => {
     const k = (input.key || '').toLowerCase();
     const ctrl = input.control || input.meta;
     if (k === 'f5' || k === 'f11' || k === 'f12' ||
-        (ctrl && k === 'r') || (ctrl && k === 'w') ||
+        (ctrl && k === 'r') ||
         (ctrl && input.shift && k === 'i') ||
-        (ctrl && input.shift && k === 'r') ||
-        (input.alt && k === 'f4')) {
+        (ctrl && input.shift && k === 'r')) {
       e.preventDefault();
     }
   });
+}
+
+// חלון צף מעל האפליקציה לאתרים חיצוניים (תו נכה וכו')
+let extWin = null;
+function openExternal(url) {
+  if (extWin && !extWin.isDestroyed()) {
+    extWin.loadURL(url); extWin.focus(); return;
+  }
+  extWin = new BrowserWindow({
+    width: 520, height: 800, alwaysOnTop: true, parent: win,
+    title: 'אינפיניגארד', autoHideMenuBar: true,
+    webPreferences: { contextIsolation: true }
+  });
+  extWin.loadURL(url);
+  extWin.on('closed', () => { extWin = null; });
 }
 
 function moveToNextDisplay() {
   const all = displays();
   if (all.length < 2) return;
   dispIndex = (dispIndex + 1) % all.length;
-  placeOn(all[dispIndex]);
+  const b = all[dispIndex].bounds;
+  win.setFullScreen(false);
+  win.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
+  win.setFullScreen(true);
 }
 
 const PROMPT_HTML = `<!doctype html><html dir="rtl"><body style="margin:0;font-family:Arial,sans-serif;direction:rtl;background:#101B2D;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh">
@@ -84,13 +101,12 @@ ipcRenderer.on('exit-wrong', function(){ document.getElementById('err').textCont
 
 let promptWin = null;
 function openExitPrompt() {
-  if (promptWin) { try { promptWin.focus(); } catch (_) {} return; }
+  if (promptWin && !promptWin.isDestroyed()) { promptWin.focus(); return; }
   promptWin = new BrowserWindow({
     width: 320, height: 210, frame: false, alwaysOnTop: true,
     resizable: false, parent: win, modal: true, skipTaskbar: true,
     webPreferences: { nodeIntegration: true, contextIsolation: false, devTools: false }
   });
-  promptWin.setAlwaysOnTop(true, 'screen-saver');
   promptWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(PROMPT_HTML));
   promptWin.on('closed', () => { promptWin = null; });
 }
@@ -99,13 +115,13 @@ ipcMain.on('exit-try', (ev, code) => {
   if (String(code) === EXIT_CODE) { allowQuit = true; app.exit(0); }
   else { ev.sender.send('exit-wrong'); }
 });
-ipcMain.on('exit-cancel', () => { if (promptWin) promptWin.close(); });
+ipcMain.on('exit-cancel', () => { if (promptWin && !promptWin.isDestroyed()) promptWin.close(); });
 
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   createWindow();
-  globalShortcut.register('Control+Alt+Shift+Q', openExitPrompt);
-  globalShortcut.register('Control+Alt+Shift+M', moveToNextDisplay);
+  globalShortcut.register('Control+Alt+Shift+Q', openExitPrompt);   // יציאה (קוד)
+  globalShortcut.register('Control+Alt+Shift+M', moveToNextDisplay); // העבר צג
 });
 
 app.on('will-quit', () => globalShortcut.unregisterAll());
